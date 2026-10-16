@@ -9,6 +9,13 @@
 #            the CRC_ATLAS_FILE environment variable.
 # ─────────────────────────────────────────────────────────────────────────────
 
+.required <- c("shiny", "bslib", "dplyr", "tidyr", "ggplot2", "scales", "DT")
+.missing <- .required[!vapply(.required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(.missing))
+  stop("CRC Atlas Explorer needs these R packages: ", paste(.missing, collapse = ", "),
+       "\nInstall them with:\n  install.packages(c(",
+       paste0('"', .missing, '"', collapse = ", "), "))", call. = FALSE)
+
 library(shiny)
 library(bslib)
 library(dplyr)
@@ -104,9 +111,58 @@ ATLAS_SOURCE <- attr(atlas, "source_file")
 GROUP_COLS  <- setdiff(.cat_cols[.nlev >= 2 & .nlev <= 120], .drop)
 FILTER_COLS <- GROUP_COLS
 
+# Thematic grouping, used to navigate the metadata-column overview.
+COL_GROUPS <- list(
+  identity   = c("dataset", "study_id", "sample_id", "patient_id", "donor_id", "replicate",
+                 "original_obs_names"),
+  condition  = c("cohort", "medical_condition", "cancer_type", "sample_type", "tumor_source",
+                 "sample_tissue", "anatomic_region", "anatomic_location", "disease",
+                 "tissue", "tissue_type", "is_primary_data"),
+  tumor      = c("tumor_stage", "tumor_stage_TNM", "tumor_stage_TNM_T", "tumor_stage_TNM_N",
+                 "tumor_stage_TNM_M", "tumor_size", "tumor_dimensions", "tumor_grade",
+                 "histological_type", "tumor_immune_type", "CMS_type_Guinney_2015_Nat_Med",
+                 "TME_subtype_Bagaev_Cancer_Cell_2021"),
+  molecular  = c("microsatellite_status", "mismatch_repair_deficiency_status",
+                 "MLH1_promoter_methylation_status"),
+  patient    = c("sex", "age", "age_numeric", "self_reported_ethnicity", "development_stage",
+                 "organism"),
+  treatment  = c("treatment_status_before_resection", "treatment_drug", "treatment_response",
+                 "RECIST"),
+  technical  = c("platform", "platform_fine", "assay", "cellranger_version", "reference_genome",
+                 "matrix_type", "enrichment_cell_types", "tissue_cell_state", "suspension_type"),
+  provenance = c("tissue_processing_lab", "hospital_location", "country",
+                 "NCBI_BioProject_accession", "SRA_sample_accession", "GEO_sample_accession",
+                 "ENA_sample_accession", "synapse_sample_accession", "study_doi", "study_pmid"),
+  cell_counts = c(CELLTYPES, "low_cnv_burden", "high_cnv_burden", "n_cells")
+)
+# gene-level status columns, and the CELLxGENE ontology ids, are regular patterns
+COL_GROUPS$molecular <- c(COL_GROUPS$molecular,
+  setdiff(grep("_status$", names(atlas), value = TRUE),
+          c("microsatellite_status", "mismatch_repair_deficiency_status",
+            "MLH1_promoter_methylation_status", "treatment_status_before_resection")))
+COL_GROUPS$ontology <- grep("_ontology_term_id$", names(atlas), value = TRUE)
+
+col_group <- function(cols) {
+  lookup <- unlist(lapply(names(COL_GROUPS), function(g)
+    setNames(rep(g, length(COL_GROUPS[[g]])), COL_GROUPS[[g]])))
+  out <- unname(lookup[cols])
+  out[is.na(out)] <- "other"
+  out
+}
+
+fmt_num <- function(x) {
+  if (!is.finite(x)) return("-")
+  if (abs(x - round(x)) < 1e-9) format(round(x), big.mark = ",", trim = TRUE)
+  else format(round(x, 2), big.mark = ",", trim = TRUE)
+}
+
 # Columns offered as always-visible "quick" filters.
 QUICK <- intersect(c("cohort", "medical_condition", "study_id", "sample_type",
                      "sample_tissue", "platform"), FILTER_COLS)
+# Treatment fields get their own always-visible panel.
+TREATMENT <- intersect(c("treatment_status_before_resection", "treatment_drug",
+                         "treatment_response", "RECIST"), FILTER_COLS)
+PINNED <- c(QUICK, TREATMENT)
 EXTRA_DEFAULT <- character(0)
 
 choices_for <- function(col) {
@@ -163,7 +219,7 @@ fmt_n <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
 sidebar_ui <- sidebar(
   width = 340, open = TRUE,
   accordion(
-    open = c("Quick filters", "Numeric filters"),
+    open = c("Quick filters", "Treatment", "Numeric filters"),
     accordion_panel(
       "Quick filters", icon = NULL,
       lapply(QUICK, function(col)
@@ -173,9 +229,19 @@ sidebar_ui <- sidebar(
       )
     ),
     accordion_panel(
+      "Treatment", icon = NULL,
+      helpText("Only a subset of samples carries treatment annotation - the",
+               "counts in each label show how many are unannotated."),
+      lapply(TREATMENT, function(col)
+        selectizeInput(paste0("flt_", make.names(col)), col_label(col),
+                       choices = choices_for(col), selected = NULL, multiple = TRUE,
+                       options = list(placeholder = "all", plugins = list("remove_button")))
+      )
+    ),
+    accordion_panel(
       "More metadata filters",
       helpText("Pick any metadata column, then choose the values to keep."),
-      selectizeInput("extra_cols", NULL, choices = setdiff(FILTER_COLS, QUICK),
+      selectizeInput("extra_cols", NULL, choices = setdiff(FILTER_COLS, PINNED),
                      selected = EXTRA_DEFAULT, multiple = TRUE,
                      options = list(placeholder = "add a column to filter on...",
                                     plugins = list("remove_button"))),
@@ -292,6 +358,26 @@ ui <- page_sidebar(
       )
     ),
     nav_panel(
+      "Metadata columns",
+      card(card_body(layout_columns(
+        col_widths = c(5, 4, 3),
+        selectizeInput("ov_col", "Inspect column", choices = NULL, selected = NULL),
+        radioButtons("ov_scope", "Describe", inline = TRUE,
+                     choices = c("current filters", "whole atlas"),
+                     selected = "current filters"),
+        div(class = "pt-4", downloadButton("dl_overview", "Column overview (CSV)",
+                                           class = "btn-sm"))
+      ))),
+      layout_columns(
+        col_widths = c(7, 5),
+        card(full_screen = TRUE,
+             card_header("All metadata columns - click a row to inspect it"),
+             card_body(DTOutput("ov_tbl"))),
+        card(full_screen = TRUE, card_header(textOutput("ov_detail_header")),
+             card_body(uiOutput("ov_plot_ui"), DTOutput("ov_detail_tbl")))
+      )
+    ),
+    nav_panel(
       "Study overview",
       card(full_screen = TRUE,
            card_header(div(class = "d-flex justify-content-between align-items-center",
@@ -368,7 +454,7 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$reset, {
-    for (col in union(QUICK, input$extra_cols))
+    for (col in union(PINNED, input$extra_cols))
       updateSelectizeInput(session, paste0("flt_", make.names(col)), selected = character(0))
     updateSelectizeInput(session, "extra_cols", selected = character(0))
     updateSliderInput(session, "age", value = c(floor(min(atlas$age_numeric, na.rm = TRUE)),
@@ -388,7 +474,7 @@ server <- function(input, output, session) {
     d <- atlas
     d$n_cells <- rowSums(d[keep_ct()], na.rm = TRUE)
 
-    for (col in union(QUICK, input$extra_cols)) {
+    for (col in union(PINNED, input$extra_cols)) {
       v <- input[[paste0("flt_", make.names(col))]]
       if (!is.null(v) && length(v)) d <- d[match_vals(d[[col]], v), , drop = FALSE]
     }
@@ -639,6 +725,140 @@ server <- function(input, output, session) {
                              scrollX = TRUE)) %>%
       formatCurrency(c("n_cells", "n_samples"), currency = "", digits = 0)
   })
+
+  # ---- metadata column overview ---------------------------------------------
+  ov_data <- reactive({
+    if (identical(input$ov_scope, "whole atlas")) atlas else dat()
+  })
+
+  # one row per column: type, number of levels, missingness, and a value preview
+  col_overview <- reactive({
+    d <- ov_data()
+    validate(need(nrow(d) > 0, "No samples match the current filters."))
+    cols <- names(d)
+    rows <- lapply(cols, function(cl) {
+      v <- d[[cl]]
+      n_miss <- sum(is.na(v))
+      if (is.numeric(v)) {
+        q <- suppressWarnings(quantile(v, c(0, 0.5, 1), na.rm = TRUE))
+        summ <- if (all(is.na(v))) "all missing" else
+          paste0("min ", fmt_num(q[[1]]), " | median ", fmt_num(q[[2]]),
+                 " | max ", fmt_num(q[[3]]))
+        n_lev <- length(unique(stats::na.omit(v)))
+      } else {
+        vc <- sort(table(as.character(v)), decreasing = TRUE)
+        n_lev <- length(vc)
+        top <- utils::head(vc, 3)
+        summ <- if (!n_lev) "all missing" else
+          paste0(paste0(names(top), " (", as.integer(top), ")", collapse = ", "),
+                 if (n_lev > 3) paste0(", +", n_lev - 3, " more") else "")
+      }
+      data.frame(column = cl, group = col_group(cl),
+                 type = if (is.numeric(v)) "numeric" else
+                        if (is.logical(v)) "logical" else "categorical",
+                 n_levels = n_lev, n_missing = n_miss,
+                 pct_missing = round(100 * n_miss / nrow(d), 1),
+                 values = summ, stringsAsFactors = FALSE)
+    })
+    do.call(rbind, rows)
+  })
+
+  observeEvent(col_overview(), {
+    cur <- isolate(input$ov_col)
+    choices <- split(col_overview()$column, col_overview()$group)
+    updateSelectizeInput(session, "ov_col", choices = choices,
+                         selected = if (!is.null(cur) && nzchar(cur)) cur else "medical_condition",
+                         server = FALSE)
+  }, once = TRUE)
+
+  observeEvent(input$ov_tbl_rows_selected, {
+    updateSelectizeInput(session, "ov_col",
+                         selected = col_overview()$column[input$ov_tbl_rows_selected])
+  })
+
+  ov_col <- reactive({
+    cl <- input$ov_col
+    if (is.null(cl) || !nzchar(cl) || !cl %in% names(atlas)) "medical_condition" else cl
+  })
+
+  output$ov_detail_header <- renderText({
+    cl <- ov_col()
+    row <- col_overview()[col_overview()$column == cl, ]
+    paste0(cl, "  -  ", row$type, ", ", row$n_levels, " levels, ",
+           row$n_missing, " of ", nrow(ov_data()), " samples not annotated")
+  })
+
+  ov_detail <- reactive({
+    d <- ov_data(); cl <- ov_col(); v <- d[[cl]]
+    if (is.numeric(v)) {
+      s <- c(n = sum(!is.na(v)), missing = sum(is.na(v)),
+             min = suppressWarnings(min(v, na.rm = TRUE)),
+             q1 = unname(quantile(v, 0.25, na.rm = TRUE)),
+             median = stats::median(v, na.rm = TRUE),
+             q3 = unname(quantile(v, 0.75, na.rm = TRUE)),
+             max = suppressWarnings(max(v, na.rm = TRUE)),
+             mean = mean(v, na.rm = TRUE), sd = stats::sd(v, na.rm = TRUE))
+      data.frame(statistic = names(s), value = vapply(s, fmt_num, character(1)),
+                 stringsAsFactors = FALSE, row.names = NULL)
+    } else {
+      out <- d %>% mutate(.v = lab_na(.data[[cl]])) %>% group_by(.v) %>%
+        summarise(n_samples = dplyr::n(), n_patients = n_distinct(patient_id),
+                  n_studies = n_distinct(study_id), n_cells = sum(n_cells), .groups = "drop") %>%
+        mutate(pct_samples = round(100 * n_samples / sum(n_samples), 1)) %>%
+        arrange(desc(n_samples)) %>%
+        relocate(pct_samples, .after = n_samples)
+      names(out)[1] <- cl
+      as.data.frame(out)
+    }
+  })
+
+  ov_plot <- function() {
+    d <- ov_data(); cl <- ov_col(); v <- d[[cl]]
+    if (is.numeric(v)) {
+      validate(need(any(!is.na(v)), paste(cl, "has no values in this selection.")))
+      return(ggplot(d[!is.na(d[[cl]]), , drop = FALSE], aes(x = .data[[cl]])) +
+               geom_histogram(bins = 30, fill = PALETTE[1], colour = "white", linewidth = 0.2) +
+               scale_y_continuous(expand = expansion(c(0, 0.05))) +
+               labs(x = cl, y = "Samples") + base_theme)
+    }
+    tb <- ov_detail()
+    names(tb)[1] <- ".v"
+    capped <- utils::head(tb, 40)
+    capped$.v <- factor(capped$.v, levels = rev(capped$.v))
+    ggplot(capped, aes(x = .v, y = n_samples)) +
+      geom_col(fill = PALETTE[1], width = 0.78) +
+      geom_text(aes(label = n_samples), hjust = -0.15, size = 3) +
+      scale_y_continuous(expand = expansion(c(0, 0.15))) +
+      coord_flip() +
+      labs(x = NULL, y = "Samples",
+           subtitle = if (nrow(tb) > 40) paste("showing the 40 most frequent of",
+                                               nrow(tb), "levels") else NULL) +
+      base_theme
+  }
+
+  output$ov_plot_ui <- renderUI({
+    v <- ov_data()[[ov_col()]]
+    h <- if (is.numeric(v)) 300 else
+      max(220, min(900, 70 + 20 * min(40, length(unique(lab_na(v))))))
+    plotOutput("ov_plot", height = paste0(h, "px"))
+  })
+  output$ov_plot <- renderPlot(ov_plot(), res = 100)
+
+  output$ov_tbl <- renderDT(
+    datatable(col_overview(), rownames = FALSE, filter = "top",
+              selection = list(mode = "single", selected = NULL),
+              options = list(pageLength = 15, scrollX = TRUE,
+                             columnDefs = list(list(width = "260px", targets = 6))))
+  )
+  output$ov_detail_tbl <- renderDT(
+    datatable(ov_detail(), rownames = FALSE, extensions = "Buttons",
+              options = list(pageLength = 10, dom = "Bfrtip", buttons = c("csv", "excel"),
+                             scrollX = TRUE))
+  )
+  output$dl_overview <- downloadHandler(
+    filename = function() paste0("crc_atlas_column_overview_", Sys.Date(), ".csv"),
+    content = function(file) write.csv(col_overview(), file, row.names = FALSE)
+  )
 
   # ---- study overview -------------------------------------------------------
   study_summary <- reactive({
